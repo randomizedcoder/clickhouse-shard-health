@@ -1,0 +1,10 @@
+clickhouse-shard-health
+bin/
+config.yaml
+*.exe
+*.test
+*.out
+.idea/
+.vscode/
+grafana/
+prometheus.yml

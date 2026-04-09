@@ -1,0 +1,20 @@
+# clickhouse-shard-health configuration
+#
+# Environment variables are expanded in all string values: ${VAR_NAME}
+
+# How often to run health checks. Default: 3m.
+interval: 3m
+
+# Port to expose Prometheus /metrics endpoint. Default: 9363.
+metricsPort: 9363
+
+# One or more ClickHouse clusters to monitor.
+clusters:
+  - name: default
+    dsn: "clickhouse://${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}@clickhouse-host:9000/${CLICKHOUSE_DATABASE}?secure=false"
+    database: mydb
+
+  # Add more clusters as needed:
+  # - name: default
+  #   dsn: "clickhouse://readonly:password@logs-host:9000/kubernetes"
+  #   database: kubernetes
