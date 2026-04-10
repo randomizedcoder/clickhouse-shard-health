@@ -1,11 +1,14 @@
+// Package main is the entry point for clickhouse-shard-health.
 package main
 
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,11 +23,24 @@ import (
 
 var version = "dev"
 
+func pprofEnabled() bool {
+	if os.Getenv("PPROF_ENABLED") != "" {
+		return true
+	}
+	enabled := flag.Bool("pprof", false, "enable pprof profiling endpoints at /debug/pprof/")
+	flag.Parse()
+	return *enabled
+}
+
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	enablePprof := pprofEnabled()
+
+	var logLevel slog.LevelVar
+	logLevel.Set(slog.LevelInfo)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &logLevel}))
 	slog.SetDefault(logger)
 
-	logger.Info("starting clickhouse-shard-health", "version", version)
+	logger.Info("starting clickhouse-shard-health", "version", version, "pprof", enablePprof)
 
 	configPath := os.Getenv("CONFIG_PATH")
 	if configPath == "" {
@@ -37,35 +53,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	clusters := make([]health.ClusterConfig, 0, len(cfg.Clusters))
-	for _, entry := range cfg.Clusters {
-		opts, err := clickhouse.ParseDSN(entry.DSN)
-		if err != nil {
-			logger.Error("failed to parse ClickHouse DSN", "error", err, "cluster", entry.Name)
-			os.Exit(1)
-		}
-
-		conn, err := clickhouse.Open(opts)
-		if err != nil {
-			logger.Error("failed to open ClickHouse connection", "error", err, "cluster", entry.Name)
-			os.Exit(1)
-		}
-
-		clusters = append(clusters, health.ClusterConfig{
-			Conn:        conn,
-			ClusterName: entry.Name,
-			Database:    entry.Database,
-		})
+	clusters, clusterErr := buildClusters(cfg.Clusters, logger)
+	if clusterErr != nil {
+		os.Exit(1)
 	}
 
 	checker := health.NewChecker(clusters, health.WithLogger(logger))
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
+		_, _ = fmt.Fprintln(w, "ok")
 	})
+
+	if enablePprof {
+		logger.Info("pprof endpoints enabled at /debug/pprof/")
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 
 	metricsAddr := fmt.Sprintf(":%d", cfg.MetricsPort)
 	server := &http.Server{
@@ -79,22 +88,54 @@ func main() {
 
 	go func() {
 		logger.Info("metrics server starting", "addr", metricsAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("metrics server failed", "error", err)
+		if listenErr := server.ListenAndServe(); listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
+			logger.Error("metrics server failed", "error", listenErr)
 			stop()
 		}
 	}()
 
-	if err := checker.Run(ctx, cfg.Interval); err != nil && !errors.Is(err, context.Canceled) {
-		logger.Error("checker exited", "error", err)
+	if runErr := checker.Run(ctx, cfg.Interval); runErr != nil && !errors.Is(runErr, context.Canceled) {
+		logger.Error("checker exited", "error", runErr)
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	_ = server.Shutdown(shutdownCtx)
+
+	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
+		logger.Error("server shutdown failed", "error", shutdownErr)
+	}
 
 	for _, cl := range clusters {
-		_ = cl.Conn.Close()
+		if closeErr := cl.Conn.Close(); closeErr != nil {
+			logger.Error("failed to close connection", "error", closeErr, "cluster", cl.ClusterName)
+		}
 	}
+
 	logger.Info("shutdown complete")
+}
+
+func buildClusters(entries []config.ClusterEntry, logger *slog.Logger) ([]health.ClusterConfig, error) {
+	clusters := make([]health.ClusterConfig, 0, len(entries))
+
+	for _, entry := range entries {
+		opts, parseErr := clickhouse.ParseDSN(entry.DSN)
+		if parseErr != nil {
+			logger.Error("failed to parse ClickHouse DSN", "error", parseErr, "cluster", entry.Name)
+			return nil, parseErr
+		}
+
+		conn, openErr := clickhouse.Open(opts)
+		if openErr != nil {
+			logger.Error("failed to open ClickHouse connection", "error", openErr, "cluster", entry.Name)
+			return nil, openErr
+		}
+
+		clusters = append(clusters, health.ClusterConfig{
+			Conn:        conn,
+			ClusterName: entry.Name,
+			Database:    entry.Database,
+		})
+	}
+
+	return clusters, nil
 }

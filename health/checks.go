@@ -2,7 +2,6 @@ package health
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +23,7 @@ const (
 	queryExpectedNodes = "SELECT host_name, shard_num, replica_num FROM system.clusters WHERE cluster = @cluster"
 
 	// clusterAllReplicas() is a table function — its arguments cannot be parameterized,
-	// so we use fmt.Sprintf for the cluster name in these queries.
+	// so the cluster name is interpolated via fmt.Sprintf at startup (see clusterQueries).
 	queryProbeNodes = "SELECT hostName() AS host FROM clusterAllReplicas('%s', system.one) " +
 		"SETTINGS skip_unavailable_shards = 1"
 
@@ -71,37 +70,42 @@ func (c *Checker) checkNodeReachability(ctx context.Context, cluster ClusterConf
 	queryCtxProbe, cancelProbe := context.WithTimeout(ctx, queryTimeout)
 	defer cancelProbe()
 
-	type hostRow struct {
-		Host string `ch:"host"`
-	}
-
 	var respondingHosts []hostRow
-	probeQuery := fmt.Sprintf(queryProbeNodes, cluster.ClusterName)
-	if err := cluster.Conn.Select(queryCtxProbe, &respondingHosts, probeQuery); err != nil {
+	if err := cluster.Conn.Select(queryCtxProbe, &respondingHosts, c.queries[cluster.ClusterName].probeNodes); err != nil {
 		c.logger.Error("failed to probe cluster nodes via system.one", "error", err, "cluster", cluster.ClusterName)
 		c.metrics.healthCheckErrors.WithLabelValues(cluster.ClusterName, checkNodeReachabilityProbe).Inc()
 		return
 	}
 
-	respondingSet := make(map[string]bool, len(respondingHosts))
-	for _, h := range respondingHosts {
+	c.setNodeReachabilityMetrics(cluster.ClusterName, expectedNodes, respondingHosts)
+}
+
+// setNodeReachabilityMetrics compares expected nodes against responding hosts and sets metrics.
+func (c *Checker) setNodeReachabilityMetrics(clusterName string, expected []clusterNode, responding []hostRow) {
+	respondingSet := make(map[string]bool, len(responding))
+	for _, h := range responding {
 		respondingSet[StripPodOrdinal(ShortHostname(h.Host))] = true
 	}
 
-	for _, node := range expectedNodes {
-		shardStr := strconv.FormatUint(uint64(node.ShardNum), 10)
-		replicaStr := strconv.FormatUint(uint64(node.ReplicaNum), 10)
+	labels := make([]string, 4)
+	labels[0] = clusterName
+
+	for _, node := range expected {
+		labels[1] = node.HostName
+		labels[2] = strconv.FormatUint(uint64(node.ShardNum), 10)
+		labels[3] = strconv.FormatUint(uint64(node.ReplicaNum), 10)
+
 		if respondingSet[ShortHostname(node.HostName)] {
-			c.metrics.nodeReachable.WithLabelValues(cluster.ClusterName, node.HostName, shardStr, replicaStr).Set(1)
+			c.metrics.nodeReachable.WithLabelValues(labels...).Set(1)
 			continue
 		}
 
-		c.metrics.nodeReachable.WithLabelValues(cluster.ClusterName, node.HostName, shardStr, replicaStr).Set(0)
+		c.metrics.nodeReachable.WithLabelValues(labels...).Set(0)
 		c.logger.Warn("ClickHouse node unreachable",
-			"cluster", cluster.ClusterName,
+			"cluster", clusterName,
 			"host", node.HostName,
-			"shard", shardStr,
-			"replica", replicaStr,
+			"shard", labels[2],
+			"replica", labels[3],
 		)
 	}
 }
@@ -112,16 +116,26 @@ func (c *Checker) checkReplicaHealth(ctx context.Context, cluster ClusterConfig)
 	defer cancel()
 
 	var rows []replicaHealthRow
-	query := fmt.Sprintf(queryReplicaHealth, cluster.ClusterName)
-
-	if err := cluster.Conn.Select(queryCtx, &rows, query, clickhouse.Named("database", cluster.Database)); err != nil {
+	if err := cluster.Conn.Select(queryCtx, &rows, c.queries[cluster.ClusterName].replicaHealth,
+		clickhouse.Named("database", cluster.Database)); err != nil {
 		c.logger.Error("failed to query system.replicas", "error", err, "cluster", cluster.ClusterName)
 		c.metrics.healthCheckErrors.WithLabelValues(cluster.ClusterName, checkReplicaHealth).Inc()
 		return
 	}
 
+	c.setReplicaHealthMetrics(cluster.ClusterName, rows)
+}
+
+// setReplicaHealthMetrics sets Prometheus metrics from replica health query results.
+func (c *Checker) setReplicaHealthMetrics(clusterName string, rows []replicaHealthRow) {
+	labels := make([]string, 5)
+	labels[0] = clusterName
+
 	for _, r := range rows {
-		labels := []string{cluster.ClusterName, r.Host, r.Database, r.Table, r.ReplicaName}
+		labels[1] = r.Host
+		labels[2] = r.Database
+		labels[3] = r.Table
+		labels[4] = r.ReplicaName
 		c.metrics.replicaAbsoluteDelay.WithLabelValues(labels...).Set(float64(r.AbsoluteDelay))
 		c.metrics.replicaQueueSize.WithLabelValues(labels...).Set(float64(r.QueueSize))
 		c.metrics.replicaIsReadonly.WithLabelValues(labels...).Set(float64(r.IsReadonly))
@@ -136,18 +150,27 @@ func (c *Checker) checkStuckReplicationQueue(ctx context.Context, cluster Cluste
 	defer cancel()
 
 	var rows []stuckQueueRow
-	query := fmt.Sprintf(queryStuckReplicationQueue, cluster.ClusterName)
-
-	if err := cluster.Conn.Select(queryCtx, &rows, query, clickhouse.Named("database", cluster.Database)); err != nil {
+	if err := cluster.Conn.Select(queryCtx, &rows, c.queries[cluster.ClusterName].stuckReplicationQueue,
+		clickhouse.Named("database", cluster.Database)); err != nil {
 		c.logger.Error("failed to query system.replication_queue", "error", err, "cluster", cluster.ClusterName)
 		c.metrics.healthCheckErrors.WithLabelValues(cluster.ClusterName, checkStuckReplicationQueue).Inc()
 		return
 	}
 
+	c.setStuckReplicationQueueMetrics(cluster.ClusterName, rows)
+}
+
+// setStuckReplicationQueueMetrics sets Prometheus metrics from stuck replication queue results.
+func (c *Checker) setStuckReplicationQueueMetrics(clusterName string, rows []stuckQueueRow) {
+	labels := make([]string, 5)
+	labels[0] = clusterName
+
 	for _, r := range rows {
-		c.metrics.replicationQueueStuckEntries.WithLabelValues(
-			cluster.ClusterName, r.Host, r.Database, r.Table, r.Type,
-		).Set(float64(r.Cnt))
+		labels[1] = r.Host
+		labels[2] = r.Database
+		labels[3] = r.Table
+		labels[4] = r.Type
+		c.metrics.replicationQueueStuckEntries.WithLabelValues(labels...).Set(float64(r.Cnt))
 	}
 }
 
@@ -157,16 +180,26 @@ func (c *Checker) checkStuckMutations(ctx context.Context, cluster ClusterConfig
 	defer cancel()
 
 	var rows []stuckMutationRow
-	query := fmt.Sprintf(queryStuckMutations, cluster.ClusterName)
-
-	if err := cluster.Conn.Select(queryCtx, &rows, query, clickhouse.Named("database", cluster.Database)); err != nil {
+	if err := cluster.Conn.Select(queryCtx, &rows, c.queries[cluster.ClusterName].stuckMutations,
+		clickhouse.Named("database", cluster.Database)); err != nil {
 		c.logger.Error("failed to query system.mutations", "error", err, "cluster", cluster.ClusterName)
 		c.metrics.healthCheckErrors.WithLabelValues(cluster.ClusterName, checkStuckMutations).Inc()
 		return
 	}
 
+	c.setStuckMutationsMetrics(cluster.ClusterName, rows)
+}
+
+// setStuckMutationsMetrics sets Prometheus metrics from stuck mutation results.
+func (c *Checker) setStuckMutationsMetrics(clusterName string, rows []stuckMutationRow) {
+	labels := make([]string, 4)
+	labels[0] = clusterName
+
 	for _, r := range rows {
-		c.metrics.stuckMutations.WithLabelValues(cluster.ClusterName, r.Host, r.Database, r.Table).Set(float64(r.Cnt))
+		labels[1] = r.Host
+		labels[2] = r.Database
+		labels[3] = r.Table
+		c.metrics.stuckMutations.WithLabelValues(labels...).Set(float64(r.Cnt))
 	}
 }
 
@@ -183,14 +216,26 @@ func (c *Checker) checkDDLQueueStatus(ctx context.Context, cluster ClusterConfig
 		return
 	}
 
+	c.setDDLQueueStatusMetrics(cluster.ClusterName, rows)
+}
+
+// setDDLQueueStatusMetrics sets Prometheus metrics from DDL queue status results.
+func (c *Checker) setDDLQueueStatusMetrics(clusterName string, rows []ddlQueueRow) {
+	labels := make([]string, 2)
+	labels[0] = clusterName
+
 	for _, r := range rows {
-		c.metrics.ddlQueueStatus.WithLabelValues(cluster.ClusterName, r.Status).Set(float64(r.Cnt))
+		labels[1] = r.Status
+		c.metrics.ddlQueueStatus.WithLabelValues(labels...).Set(float64(r.Cnt))
 	}
 }
 
 // ShortHostname returns the first segment of a hostname, stripping any domain suffix.
 func ShortHostname(host string) string {
-	return strings.SplitN(host, ".", 2)[0]
+	if idx := strings.IndexByte(host, '.'); idx >= 0 {
+		return host[:idx]
+	}
+	return host
 }
 
 // StripPodOrdinal removes the trailing StatefulSet pod ordinal from a ClickHouse hostname.

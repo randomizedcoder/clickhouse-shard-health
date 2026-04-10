@@ -1,7 +1,9 @@
+// Package health implements ClickHouse shard health checks and Prometheus metric collection.
 package health
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -13,6 +15,7 @@ type Checker struct {
 	clusters []ClusterConfig
 	logger   *slog.Logger
 	metrics  *metrics
+	queries  map[clusterName]clusterQueries
 }
 
 // Option configures a Checker.
@@ -37,6 +40,7 @@ func NewChecker(clusters []ClusterConfig, opts ...Option) *Checker {
 	c := &Checker{
 		clusters: clusters,
 		logger:   slog.Default(),
+		queries:  make(map[clusterName]clusterQueries, len(clusters)),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -45,6 +49,15 @@ func NewChecker(clusters []ClusterConfig, opts ...Option) *Checker {
 	if c.metrics == nil {
 		c.metrics = newMetrics(prometheus.DefaultRegisterer)
 	}
+	// Pre-compute formatted queries for each cluster to avoid repeated fmt.Sprintf calls.
+	for _, cl := range clusters {
+		c.queries[cl.ClusterName] = clusterQueries{
+			probeNodes:            fmt.Sprintf(queryProbeNodes, cl.ClusterName),
+			replicaHealth:         fmt.Sprintf(queryReplicaHealth, cl.ClusterName),
+			stuckReplicationQueue: fmt.Sprintf(queryStuckReplicationQueue, cl.ClusterName),
+			stuckMutations:        fmt.Sprintf(queryStuckMutations, cl.ClusterName),
+		}
+	}
 	return c
 }
 
@@ -52,17 +65,19 @@ func NewChecker(clusters []ClusterConfig, opts ...Option) *Checker {
 func (c *Checker) CheckAll(ctx context.Context) {
 	c.metrics.resetTransient()
 	for _, cluster := range c.clusters {
+		start := time.Now()
 		c.logger.Info("running ClickHouse shard health check", "cluster", cluster.ClusterName)
 		c.checkNodeReachability(ctx, cluster)
 		c.checkReplicaHealth(ctx, cluster)
 		c.checkStuckReplicationQueue(ctx, cluster)
 		c.checkStuckMutations(ctx, cluster)
 		c.checkDDLQueueStatus(ctx, cluster)
+		c.metrics.checkDuration.WithLabelValues(cluster.ClusterName).Observe(time.Since(start).Seconds())
 	}
 }
 
 // Run starts periodic health checks at the given interval.
-// It blocks until the context is cancelled.
+// It blocks until the context is canceled.
 func (c *Checker) Run(ctx context.Context, interval time.Duration) error {
 	c.logger.Info("starting ClickHouse shard health checker", "interval", interval, "clusters", len(c.clusters))
 

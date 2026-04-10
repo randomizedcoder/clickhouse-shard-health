@@ -2,10 +2,13 @@ package health
 
 import "github.com/ClickHouse/clickhouse-go/v2"
 
+// clusterName identifies a ClickHouse cluster (as registered in system.clusters).
+type clusterName = string
+
 // ClusterConfig holds the connection and metadata for a single ClickHouse cluster.
 type ClusterConfig struct {
 	Conn        clickhouse.Conn
-	ClusterName string
+	ClusterName clusterName
 	Database    string
 }
 
@@ -50,4 +53,19 @@ type stuckMutationRow struct {
 type ddlQueueRow struct {
 	Status string `ch:"status"`
 	Cnt    uint64 `ch:"cnt"`
+}
+
+// hostRow represents a responding host from a clusterAllReplicas() probe.
+type hostRow struct {
+	Host string `ch:"host"`
+}
+
+// clusterQueries holds pre-formatted query strings for a single cluster.
+// Queries using clusterAllReplicas() require the cluster name as a literal,
+// so we pre-compute them once at startup to avoid repeated fmt.Sprintf calls.
+type clusterQueries struct {
+	probeNodes            string
+	replicaHealth         string
+	stuckReplicationQueue string
+	stuckMutations        string
 }

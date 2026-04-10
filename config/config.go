@@ -1,6 +1,8 @@
+// Package config handles loading and validating clickhouse-shard-health configuration.
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -55,12 +57,12 @@ func Load(path string) (*Config, error) {
 
 	expanded := os.ExpandEnv(string(data))
 
-	if err := yaml.Unmarshal([]byte(expanded), cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
+	if unmarshalErr := yaml.Unmarshal([]byte(expanded), cfg); unmarshalErr != nil {
+		return nil, fmt.Errorf("parsing config file: %w", unmarshalErr)
 	}
 
 	if len(cfg.Clusters) == 0 {
-		return nil, fmt.Errorf("at least one cluster must be configured")
+		return nil, errors.New("at least one cluster must be configured")
 	}
 
 	for i, c := range cfg.Clusters {

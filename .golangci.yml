@@ -1,0 +1,98 @@
+# .golangci.yml
+#
+# Tier 1: Standard Lint (~2 minutes)
+# Used for: Every PR (CI gating)
+#
+# This is the default profile that balances thoroughness with speed.
+# It includes all Tier 0 checks plus security scanning and style checks.
+
+version: "2"
+
+run:
+  timeout: 5m
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters:
+  default: none
+  enable:
+    # Tier 0 (always)
+    - govet
+    - errcheck
+    - ineffassign
+    - unused
+    - staticcheck
+    # Tier 1 (CI)
+    - gosec
+    - gocritic
+    - revive
+    - noctx
+    - durationcheck
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprintln
+        - fmt.Fprintf
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+      settings:
+        shadow:
+          strict: true
+
+    staticcheck:
+      checks:
+        - "all"
+
+    gosec:
+      excludes:
+        - G115  # integer overflow: false positives for validated conversions
+        - G304  # file path from variable: config loading uses CONFIG_PATH env var
+
+    revive:
+      rules:
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: error-return
+        - name: error-strings
+        - name: increment-decrement
+        - name: var-declaration
+
+    gocyclo:
+      min-complexity: 20
+
+    funlen:
+      lines: 100
+      statements: 60
+
+  exclusions:
+    warn-unused: true
+    rules:
+      - path: "_test\\.go"
+        linters:
+          - dupl
+          - funlen
+          - gocyclo
+          - errcheck
+      # G404: math/rand is acceptable in tests
+      - path: "_test\\.go"
+        linters:
+          - gosec
+        text: "G404"
+
+output:
+  formats:
+    text:
+      print-issued-lines: true
+      print-linter-name: true

@@ -8,3 +8,7 @@ config.yaml
 .vscode/
 grafana/
 prometheus.yml
+
+# Nix build outputs
+result
+result-*

@@ -1,6 +1,19 @@
 # clickhouse-shard-health
 
-Lightweight sidecar that monitors ClickHouse cluster health and exposes Prometheus metrics. Designed for [clickhouse-operator](https://github.com/Altinity/clickhouse-operator) deployments on Kubernetes, but works with any ClickHouse cluster.
+Lightweight sidecar that monitors ClickHouse cluster health and exposes Prometheus metrics.
+
+## Why this tool
+
+ClickHouse replication problems are silent killers. A node goes down, replication lag creeps up, a mutation gets stuck — and nothing alerts you until a query fails or data diverges across replicas. The built-in system tables have all the information you need, but nobody is watching them.
+
+**clickhouse-shard-health** continuously queries ClickHouse system tables across every shard and replica in your cluster, detects problems early, and exposes everything as Prometheus metrics. Pair it with the included Grafana dashboard and you get full visibility into cluster health without writing a single query.
+
+- **Single static binary** — no runtime dependencies, no JVM, no Python
+- **Minimal footprint** — runs as a sidecar with negligible CPU and memory overhead
+- **Tiny container** — ~6 MB OCI image (binary + CA certs, no shell)
+- **Multi-architecture** — native x86_64 and Darwin builds, cross-compiled ARM64 and RISC-V
+- **Works anywhere** — designed for [clickhouse-operator](https://github.com/Altinity/clickhouse-operator) on Kubernetes, but works with any ClickHouse cluster
+- **Built-in profiling** — pprof endpoints for production debugging
 
 ## What it monitors
 
@@ -12,45 +25,63 @@ Lightweight sidecar that monitors ClickHouse cluster health and exposes Promethe
 | Stuck mutations | `system.mutations` | Mutations that have not completed (`is_done = 0`) |
 | DDL queue status | `system.distributed_ddl_queue` | DDL entries grouped by status (Finished, Inactive, etc.) |
 
-## Metrics
-
-All metrics are prefixed with `clickhouse_shard_health_`.
-
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `node_reachable` | Gauge | cluster, host, shard_num, replica_num | 1 if the node is reachable, 0 if down |
-| `replica_absolute_delay` | Gauge | cluster, host, database, table, replica_name | Replication delay in seconds (0 = healthy) |
-| `replica_queue_size` | Gauge | cluster, host, database, table, replica_name | Number of entries in the replication queue |
-| `replica_is_readonly` | Gauge | cluster, host, database, table, replica_name | 1 if the replica is in readonly mode |
-| `replica_active_count` | Gauge | cluster, host, database, table, replica_name | Number of active replicas for a table |
-| `replica_total_count` | Gauge | cluster, host, database, table, replica_name | Total number of replicas for a table |
-| `replication_queue_stuck_entries` | Gauge | cluster, host, database, table, type | Count of stuck replication queue entries |
-| `stuck_mutations` | Gauge | cluster, host, database, table | Count of incomplete mutations |
-| `ddl_queue_status` | Gauge | cluster, status | DDL queue entry count by status |
-| `health_check_errors` | Counter | cluster, query | Errors encountered during health check queries |
-
 ## Quick start
 
-### Prerequisites
+### Option A: Using Nix (recommended)
 
-- Go 1.24+
+[Nix](https://nixos.org) handles all dependencies automatically — no need to install Go or any other tooling manually. See [nix/readme.md](nix/readme.md) for installation and full details.
+
+```bash
+nix develop          # Enter dev shell with Go and all tools
+cp config.example.yaml config.yaml
+# Edit config.yaml with your cluster details
+make build && ./bin/clickhouse-shard-health
+```
+
+### Option B: Manual setup
+
+#### Prerequisites
+
+- Go 1.26+
 - A ClickHouse cluster with a monitoring user (see [ClickHouse grants](#clickhouse-grants))
 
-### Build
+#### Build and run
 
 ```bash
 make build
+
+cp config.example.yaml config.yaml
+# Edit config.yaml with your cluster details
+
+./bin/clickhouse-shard-health
 ```
 
-The binary is written to `bin/clickhouse-shard-health`.
-
-### Configure
-
-Copy the example config and edit it:
+Verify metrics are being exposed:
 
 ```bash
-cp config.example.yaml config.yaml
+curl -s localhost:9363/metrics | grep clickhouse_shard_health
 ```
+
+### Docker
+
+#### Using Nix (reproducible OCI image, ~6 MB)
+
+```bash
+nix build .#container
+docker load < ./result
+docker run --rm -v $(pwd)/config.yaml:/config.yaml -p 9363:9363 clickhouse-shard-health:<version>
+```
+
+See [nix/readme.md](nix/readme.md) for all container variants (stripped, debug) and cross-compiled images (ARM64, RISC-V).
+
+#### Using make
+
+```bash
+make docker
+docker run -v $(pwd)/config.yaml:/config.yaml -p 9363:9363 mmtretiak/clickhouse-shard-health
+```
+
+## Configuration
 
 ```yaml
 interval: 3m
@@ -67,27 +98,38 @@ Environment variables are expanded in all string values (`${CLICKHOUSE_PASSWORD}
 | Field | Default | Description |
 |---|---|---|
 | `interval` | `3m` | How often to run health checks |
-| `metricsPort` | `9363` | Port for the Prometheus `/metrics` endpoint |
+| `metricsPort` | `9363` | Port for the HTTP server (metrics, health, pprof) |
 | `clusters[].name` | required | Cluster name as it appears in `system.clusters` |
 | `clusters[].dsn` | required | ClickHouse connection string |
 | `clusters[].database` | required | Database to monitor for replica health checks |
 
-### Run
+Set a custom config path with the `CONFIG_PATH` environment variable (default: `config.yaml`).
 
-```bash
-# Default config path: config.yaml
-./bin/clickhouse-shard-health
+### CLI flags and environment variables
 
-# Custom config path
-CONFIG_PATH=/etc/clickhouse-shard-health/config.yaml ./bin/clickhouse-shard-health
-```
+| Flag | Environment Variable | Default | Description |
+|---|---|---|---|
+| `-pprof` | `PPROF_ENABLED` | disabled | Enable pprof profiling endpoints at `/debug/pprof/` |
 
-### Docker
+The environment variable takes precedence — if `PPROF_ENABLED` is set to any non-empty value, pprof is enabled regardless of the flag.
 
-```bash
-make docker
-docker run -v $(pwd)/config.yaml:/config.yaml -p 9363:9363 siden-io/clickhouse-shard-health
-```
+## Metrics
+
+All metrics are prefixed with `clickhouse_shard_health_`.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `node_reachable` | Gauge | cluster, host, shard_num, replica_num | 1 if the node is reachable, 0 if down |
+| `replica_absolute_delay` | Gauge | cluster, host, database, table, replica_name | Replication delay in seconds (0 = healthy) |
+| `replica_queue_size` | Gauge | cluster, host, database, table, replica_name | Number of entries in the replication queue |
+| `replica_is_readonly` | Gauge | cluster, host, database, table, replica_name | 1 if the replica is in readonly mode |
+| `replica_active_count` | Gauge | cluster, host, database, table, replica_name | Number of active replicas for a table |
+| `replica_total_count` | Gauge | cluster, host, database, table, replica_name | Total number of replicas for a table |
+| `replication_queue_stuck_entries` | Gauge | cluster, host, database, table, type | Count of stuck replication queue entries |
+| `stuck_mutations` | Gauge | cluster, host, database, table | Count of incomplete mutations |
+| `ddl_queue_status` | Gauge | cluster, status | DDL queue entry count by status |
+| `check_duration_seconds` | Histogram | cluster | Duration of a complete health check cycle per cluster |
+| `health_check_errors` | Counter | cluster, query | Errors encountered during health check queries |
 
 ## ClickHouse grants
 
@@ -118,7 +160,56 @@ The dashboard has panels for:
 - DDL queue status breakdown
 - Health check query error rate
 
-## Local development setup
+## Endpoints
+
+The HTTP server (default port `9363`) exposes:
+
+| Path | Description |
+|---|---|
+| `/metrics` | Prometheus metrics |
+| `/healthz` | Liveness probe (returns `200 OK`) |
+
+### Profiling (opt-in)
+
+When enabled with `-pprof` or `PPROF_ENABLED`, the following endpoints are registered:
+
+| Path | Description |
+|---|---|
+| `/debug/pprof/` | Go pprof index — CPU, memory, goroutine profiling |
+| `/debug/pprof/profile` | CPU profile (30s default, `?seconds=N` to customize) |
+| `/debug/pprof/heap` | Heap memory profile |
+| `/debug/pprof/trace` | Execution trace |
+
+Example: capture a 10-second CPU profile:
+
+```bash
+# Start with profiling enabled
+./bin/clickhouse-shard-health -pprof
+# or: PPROF_ENABLED=1 ./bin/clickhouse-shard-health
+
+# Capture profile
+go tool pprof http://localhost:9363/debug/pprof/profile?seconds=10
+```
+
+## Development
+
+```bash
+make build           # Build binary
+make test            # Run tests with race detector
+make lint            # Run golangci-lint
+make fmt             # Format code
+```
+
+### Benchmarks
+
+```bash
+go test -bench=. -benchmem ./health/
+```
+
+Benchmarks cover all metric-setting functions and hostname utilities. Use `b.ReportAllocs()` in new benchmarks to track allocations.
+
+<details>
+<summary><strong>Local development stack (Prometheus + Grafana)</strong></summary>
 
 This setup lets you run the full stack locally: health checker pointed at a port-forwarded ClickHouse cluster, with Prometheus and Grafana for visualization.
 
@@ -143,15 +234,7 @@ EOF
 make build && ./bin/clickhouse-shard-health
 ```
 
-Verify metrics are exposed:
-
-```bash
-curl -s localhost:9363/metrics | grep clickhouse_shard_health
-```
-
 ### 3. Run Prometheus
-
-Create a `prometheus.yml` scrape config:
 
 ```bash
 cat > prometheus.yml <<'EOF'
@@ -162,11 +245,7 @@ scrape_configs:
     static_configs:
       - targets: ["host.docker.internal:9363"]
 EOF
-```
 
-Start Prometheus:
-
-```bash
 docker run -d --name prometheus \
   -p 9090:9090 \
   -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
@@ -177,13 +256,9 @@ Verify the target is UP at http://localhost:9090/targets.
 
 ### 4. Run Grafana with auto-provisioned datasource and dashboard
 
-Create provisioning configs:
-
 ```bash
 mkdir -p grafana/provisioning/datasources grafana/provisioning/dashboards
-```
 
-```bash
 cat > grafana/provisioning/datasources/prometheus.yml <<'EOF'
 apiVersion: 1
 datasources:
@@ -193,9 +268,7 @@ datasources:
     url: http://host.docker.internal:9090
     isDefault: true
 EOF
-```
 
-```bash
 cat > grafana/provisioning/dashboards/default.yml <<'EOF'
 apiVersion: 1
 providers:
@@ -205,11 +278,7 @@ providers:
     options:
       path: /var/lib/grafana/dashboards
 EOF
-```
 
-Start Grafana, mounting provisioning configs and the dashboard JSON:
-
-```bash
 docker run -d --name grafana \
   -p 3000:3000 \
   -v $(pwd)/grafana/provisioning:/etc/grafana/provisioning \
@@ -219,7 +288,7 @@ docker run -d --name grafana \
   grafana/grafana
 ```
 
-Open http://localhost:3000, navigate to **Dashboards > ClickHouse > ClickHouse Shard Health**. The `ds` template variable auto-selects the provisioned Prometheus datasource.
+Open http://localhost:3000, navigate to **Dashboards > ClickHouse > ClickHouse Shard Health**.
 
 ### Cleanup
 
@@ -228,11 +297,48 @@ docker rm -f prometheus grafana
 rm -rf grafana/ prometheus.yml
 ```
 
-## Tests
+</details>
+
+## Nix
+
+This project includes a Nix flake for reproducible builds, development, and CI. See [nix/readme.md](nix/readme.md) for full details.
 
 ```bash
-make test
+nix develop          # Enter dev shell with all tools
+nix build            # Build binary (stripped+UPX, smallest)
+nix flake check      # Run all CI checks (vet, gosec, golangci-lint tiers, tests)
+nix fmt              # Format Nix files
 ```
+
+### Binary variants
+
+Every target is available in three variants. The default produces the smallest binary using UPX compression.
+
+| Variant | Package | Container | Binary | Container image |
+|---|---|---|---|---|
+| **UPX** (default) | `nix build` | `nix build .#container` | ~6 MB | ~6 MB |
+| **Stripped** | `nix build .#clickhouse-shard-health-stripped` | `nix build .#container-stripped` | ~18 MB | ~7 MB |
+| **Debug** | `nix build .#clickhouse-shard-health-debug` | `nix build .#container-debug` | ~20 MB | ~8 MB |
+
+- **UPX** — stripped with `-s -w` then compressed with [UPX](https://upx.github.io/). Smallest binary, ~15ms decompression at startup. See [Shrink your Go binaries](https://words.filippo.io/shrink-your-go-binaries-with-this-one-weird-trick/) for background.
+- **Stripped** — stripped with `-s -w` (removes debug symbols and DWARF tables). No startup overhead.
+- **Debug** — unstripped, full debug symbols. Use with `delve` or `gdb` for debugging and profiling.
+
+### Cross-compilation
+
+Cross-compiled binaries and containers for ARM64 and RISC-V are available from `x86_64-linux`, each in all three variants:
+
+```bash
+nix build .#cross-aarch64-linux                  # ARM64 (stripped+UPX)
+nix build .#cross-aarch64-linux-stripped          # ARM64 (stripped)
+nix build .#cross-aarch64-linux-debug             # ARM64 (debug)
+nix build .#container-aarch64-linux              # ARM64 container
+
+nix build .#cross-riscv64-linux                  # RISC-V 64 (stripped+UPX)
+nix build .#container-riscv64-linux              # RISC-V 64 container
+```
+
+See [nix/readme.md](nix/readme.md) for the complete package matrix across all architectures.
 
 ## License
 
