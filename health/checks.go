@@ -87,25 +87,21 @@ func (c *Checker) setNodeReachabilityMetrics(clusterName string, expected []clus
 		respondingSet[StripPodOrdinal(ShortHostname(h.Host))] = true
 	}
 
-	labels := make([]string, 4)
-	labels[0] = clusterName
-
 	for _, node := range expected {
-		labels[1] = node.HostName
-		labels[2] = strconv.FormatUint(uint64(node.ShardNum), 10)
-		labels[3] = strconv.FormatUint(uint64(node.ReplicaNum), 10)
+		shardStr := strconv.FormatUint(uint64(node.ShardNum), 10)
+		replicaStr := strconv.FormatUint(uint64(node.ReplicaNum), 10)
 
 		if respondingSet[ShortHostname(node.HostName)] {
-			c.metrics.nodeReachable.WithLabelValues(labels...).Set(1)
+			c.metrics.nodeReachable.WithLabelValues(clusterName, node.HostName, shardStr, replicaStr).Set(1)
 			continue
 		}
 
-		c.metrics.nodeReachable.WithLabelValues(labels...).Set(0)
+		c.metrics.nodeReachable.WithLabelValues(clusterName, node.HostName, shardStr, replicaStr).Set(0)
 		c.logger.Warn("ClickHouse node unreachable",
 			"cluster", clusterName,
 			"host", node.HostName,
-			"shard", labels[2],
-			"replica", labels[3],
+			"shard", shardStr,
+			"replica", replicaStr,
 		)
 	}
 }
@@ -128,14 +124,8 @@ func (c *Checker) checkReplicaHealth(ctx context.Context, cluster ClusterConfig)
 
 // setReplicaHealthMetrics sets Prometheus metrics from replica health query results.
 func (c *Checker) setReplicaHealthMetrics(clusterName string, rows []replicaHealthRow) {
-	labels := make([]string, 5)
-	labels[0] = clusterName
-
 	for _, r := range rows {
-		labels[1] = r.Host
-		labels[2] = r.Database
-		labels[3] = r.Table
-		labels[4] = r.ReplicaName
+		labels := []string{clusterName, r.Host, r.Database, r.Table, r.ReplicaName}
 		c.metrics.replicaAbsoluteDelay.WithLabelValues(labels...).Set(float64(r.AbsoluteDelay))
 		c.metrics.replicaQueueSize.WithLabelValues(labels...).Set(float64(r.QueueSize))
 		c.metrics.replicaIsReadonly.WithLabelValues(labels...).Set(float64(r.IsReadonly))
@@ -162,15 +152,10 @@ func (c *Checker) checkStuckReplicationQueue(ctx context.Context, cluster Cluste
 
 // setStuckReplicationQueueMetrics sets Prometheus metrics from stuck replication queue results.
 func (c *Checker) setStuckReplicationQueueMetrics(clusterName string, rows []stuckQueueRow) {
-	labels := make([]string, 5)
-	labels[0] = clusterName
-
 	for _, r := range rows {
-		labels[1] = r.Host
-		labels[2] = r.Database
-		labels[3] = r.Table
-		labels[4] = r.Type
-		c.metrics.replicationQueueStuckEntries.WithLabelValues(labels...).Set(float64(r.Cnt))
+		c.metrics.replicationQueueStuckEntries.WithLabelValues(
+			clusterName, r.Host, r.Database, r.Table, r.Type,
+		).Set(float64(r.Cnt))
 	}
 }
 
@@ -192,14 +177,8 @@ func (c *Checker) checkStuckMutations(ctx context.Context, cluster ClusterConfig
 
 // setStuckMutationsMetrics sets Prometheus metrics from stuck mutation results.
 func (c *Checker) setStuckMutationsMetrics(clusterName string, rows []stuckMutationRow) {
-	labels := make([]string, 4)
-	labels[0] = clusterName
-
 	for _, r := range rows {
-		labels[1] = r.Host
-		labels[2] = r.Database
-		labels[3] = r.Table
-		c.metrics.stuckMutations.WithLabelValues(labels...).Set(float64(r.Cnt))
+		c.metrics.stuckMutations.WithLabelValues(clusterName, r.Host, r.Database, r.Table).Set(float64(r.Cnt))
 	}
 }
 
@@ -221,12 +200,8 @@ func (c *Checker) checkDDLQueueStatus(ctx context.Context, cluster ClusterConfig
 
 // setDDLQueueStatusMetrics sets Prometheus metrics from DDL queue status results.
 func (c *Checker) setDDLQueueStatusMetrics(clusterName string, rows []ddlQueueRow) {
-	labels := make([]string, 2)
-	labels[0] = clusterName
-
 	for _, r := range rows {
-		labels[1] = r.Status
-		c.metrics.ddlQueueStatus.WithLabelValues(labels...).Set(float64(r.Cnt))
+		c.metrics.ddlQueueStatus.WithLabelValues(clusterName, r.Status).Set(float64(r.Cnt))
 	}
 }
 
@@ -235,6 +210,7 @@ func ShortHostname(host string) string {
 	if idx := strings.IndexByte(host, '.'); idx >= 0 {
 		return host[:idx]
 	}
+
 	return host
 }
 
